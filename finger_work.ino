@@ -19,8 +19,8 @@
 
 // ---------- CONFIG PINS & DEFAULTS ----------
 #define DEFAULT_RELAY_MODE true          // true => relay default OFF (RELAY_OFF)
-#define RELAY_ON  HIGH
-#define RELAY_OFF LOW
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
 
 const char *service_name = "PROV_RFID_LOCK";
 const char *pop = "1234567";
