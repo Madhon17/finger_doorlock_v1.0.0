@@ -1,4 +1,4 @@
-/* FULL SKETCH FINAL - Auto-find free ID (C)
+    /* FULL SKETCH FINAL - Auto-find free ID (C)
  * AS608 (Adafruit_Fingerprint) + ESP32 + RainMaker integration
  * ENROLL: 2x scans (image2Tz(1), image2Tz(2), createModel, storeModel)
  * REMOVE: scan -> deleteModel(id) -> clear EEPROM
@@ -53,6 +53,9 @@ bool buzz          = true; // buzzer on by default
 // RainMaker device
 static Device my_lock("RFID LOCK", "custom.device.device");
 
+// NEW: STATUS param (global so helper can access it)
+Param status_param("STATUS", "custom.param.text", value("Ready"), PROP_FLAG_READ);
+
 // Fingerprint
 HardwareSerial FingerSerial(2);
 Adafruit_Fingerprint finger(&FingerSerial);
@@ -79,6 +82,19 @@ bool removeFingerByID(int id);
 bool removeFingerByScan();
 String authorized_access();
 void authorized_access_offline();
+
+// --- NEW helper to update STATUS param safely ---
+void setStatus(const char *msg)
+{
+    // Update RainMaker param (text) and Serial log
+    Serial.printf("[STATUS] %s\n", msg);
+    my_lock.updateAndReportParam("STATUS", msg);
+}
+
+void setStatus(String msg)
+{
+    setStatus(msg.c_str());
+}
 
 // Implementation
 void sysProvEvent(arduino_event_t *sys_event)
@@ -113,6 +129,10 @@ void sysProvEvent(arduino_event_t *sys_event)
     }
 }
 
+unsigned long relay_on_time = 0;
+const unsigned long relay_auto_off_delay = 5000;  // 3 detik
+
+
 void write_callback(Device *device, Param *param,
                     const param_val_t val, void *priv_data,
                     write_ctx_t *ctx)
@@ -135,11 +155,19 @@ void write_callback(Device *device, Param *param,
     }
 
     if (strcmp(param_name, "DOOR OPEN") == 0) {
-        relay_state = val.val.b;
-        Serial.printf("DOOR OPEN set to %s\n", relay_state ? "OPEN" : "CLOSED");
-        digitalWrite(PIN_RELAY, relay_state ? RELAY_ON : RELAY_OFF);
-        param->updateAndReport(val);
+    relay_state = val.val.b;
+    Serial.printf("DOOR OPEN set to %s\n", relay_state ? "OPEN" : "CLOSED");
+    beep();
+
+    digitalWrite(PIN_RELAY, relay_state ? RELAY_ON : RELAY_OFF);
+    param->updateAndReport(val);
+
+    // Jika relay dihidupkan, catat waktu ON
+    if (relay_state) {
+        relay_on_time = millis();
     }
+}
+
 
     if (strcmp(param_name, "ADD FINGER") == 0) {
         add_button = val.val.b;
@@ -149,19 +177,30 @@ void write_callback(Device *device, Param *param,
             if (id < 0) {
                 Serial.println("No free ID available (EEPROM full)");
                 Failure_buzzer();
+                setStatus("Add Failed: No free ID");
             } else {
                 uint8_t res = enrollFingerAt(id);
                 if (res == FINGERPRINT_OK) {
                     markIDUsed(id);
                     Serial.printf("Enroll success ID=%d\n", id);
                     success_buzzer();
+                    setStatus(String("Add Success ID ") + String(id));
                 } else {
                     Serial.printf("Enroll failed code=%d\n", res);
                     Failure_buzzer();
+                    // provide a readable message for common errors, else show code
+                    if (res == 0xE1) {
+                        setStatus("Add Failed: Timeout 1st scan");
+                    } else if (res == 0xE2) {
+                        setStatus("Add Failed: Timeout 2nd scan");
+                    } else {
+                        setStatus(String("Add Failed (code ") + String(res) + String(")"));
+                    }
                 }
             }
         } else {
             Failure_buzzer();
+            setStatus("Add Cancelled");
         }
         add_switch_off();
         delay(300);
@@ -175,16 +214,35 @@ void write_callback(Device *device, Param *param,
             if (ok) {
                 Serial.println("Remove operation succeeded");
                 success_buzzer();
+                setStatus("Remove Success");
             } else {
                 Serial.println("Remove operation failed or no matching finger");
                 Failure_buzzer();
+                setStatus("Remove Failed: No matching finger");
             }
         } else {
             Failure_buzzer();
+            setStatus("Remove Cancelled");
         }
         remove_switch_off();
         delay(300);
     }
+
+    // --------- RESTART handler via RainMaker ----------
+    if (strcmp(param_name, "RESTART") == 0) {
+        bool restart_req = val.val.b;
+        Serial.printf("RESTART param written: %s\n", restart_req ? "true" : "false");
+        // Immediately report the incoming value so app shows action
+        param->updateAndReport(val);
+
+        // Only trigger restart when set to true
+        if (restart_req) {
+            Serial.println("Restart requested from RainMaker! Restarting in 300ms...");
+            delay(300); // give time for the update to be sent
+            ESP.restart(); // perform software restart
+        }
+    }
+    // -------------------------------------------------
 }
 
 void setup()
@@ -224,7 +282,7 @@ void setup()
     my_node = RMaker.initNode("RFIDLOCK");
     my_lock.addNameParam();
 
-    Param disp("display", "custom.param.display", value("Ready"), PROP_FLAG_READ);
+    Param disp("Display", "custom.param.display", value("Ready"), PROP_FLAG_READ);
     disp.addUIType(ESP_RMAKER_UI_TEXT);
     my_lock.addParam(disp);
 
@@ -248,6 +306,20 @@ void setup()
     buzz_switch.addUIType(ESP_RMAKER_UI_TOGGLE);
     my_lock.addParam(buzz_switch);
 
+    // ---------- NEW: Restart param ----------
+    Param restart_switch("RESTART PERANGKAT", "custom.param.power", value(false),
+                         PROP_FLAG_READ | PROP_FLAG_WRITE);
+    restart_switch.addUIType(ESP_RMAKER_UI_TOGGLE);
+    my_lock.addParam(restart_switch);
+    // -----------------------------------------
+
+    // ---------- NEW: STATUS param ----------
+    status_param.addUIType(ESP_RMAKER_UI_TEXT);
+    my_lock.addParam(status_param);
+    // Ensure STATUS shows Ready on boot
+    my_lock.updateAndReportParam("STATUS", "Ready");
+    // -----------------------------------------
+
     my_lock.addCb(write_callback);
     my_node.addDevice(my_lock);
 
@@ -255,6 +327,8 @@ void setup()
     my_lock.updateAndReportParam("ADD FINGER", add_button);
     my_lock.updateAndReportParam("REMOVE FINGER", remove_button);
     my_lock.updateAndReportParam("BUZZER", buzzer_state);
+    // Ensure RESTART shows false on boot (momentary)
+    my_lock.updateAndReportParam("RESTART", false);
 
     RMaker.enableOTA(OTA_USING_PARAMS);
     RMaker.enableTZService();
@@ -281,6 +355,16 @@ void setup()
 
 void loop()
 {
+    // AUTO OFF relay
+    if (relay_state && (millis() - relay_on_time >= relay_auto_off_delay)) {
+    relay_state = false;
+    digitalWrite(PIN_RELAY, RELAY_OFF);
+    Serial.println("Pintu Akan Kembali Tertutup");
+
+    my_lock.updateAndReportParam("DOOR OPEN", false);  
+    }
+
+
     // Manual switch open
     SWITCH_STATE = digitalRead(PIN_SWITCH);
     if (SWITCH_STATE == LOW) {
